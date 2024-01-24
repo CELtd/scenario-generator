@@ -86,6 +86,31 @@ def sgt(y, seasonality, future=0):
     if future > 0:
         numpyro.deterministic("y_forecast", ys[-future:])
 
+def logistic_growth_model(x, y=None):
+    
+    # priors
+    x0 = numpyro.sample("x0", dist.Normal(x.shape[0] // 2, 50)) # midpoint
+    k = numpyro.sample("k", dist.Normal(0, 0.1)) # growth rate
+    L = numpyro.sample("L", dist.Beta(1, 1)) #ccarrying capacity
+    
+    # logistic model
+    output = numpyro.deterministic("output", L / (1 + jnp.exp(-k * (x - x0))))
+
+    # Normal likelihood --- note, won't constrain output to correct [0,1] support
+#     sigma = numpyro.sample("error", dist.HalfNormal(0.1))
+#     numpyro.sample(
+#         "obs",
+#         dist.Normal(filp, sigma),
+#         obs=y,
+#     )
+    
+    # Bernoulli likelihood version
+    numpyro.sample(
+        "obs",
+        dist.Bernoulli(probs=output),
+        obs=y,
+    )
+
 
 def check_rhat(rhat_array: NDArray, threshold: float = 1.05):
     """
@@ -308,13 +333,13 @@ def forecast_filplus_rate(train_start_date: datetime.date,
 
     ii_start = np.where(train_start_date==x_rb_onboard_train.values)[0][0]
     ii_end = np.where(train_end_date==x_rb_onboard_train.values)[0][0]
-    x_rb_onboard_train = x_rb_onboard_train[ii_start:ii_end]
-    y_rb_onboard_train = y_rb_onboard_train[ii_start:ii_end]
+    x_rb_onboard_train = x_rb_onboard_train[ii_start:ii_end+1]
+    y_rb_onboard_train = y_rb_onboard_train[ii_start:ii_end+1]
 
     ii_start = np.where(train_start_date==x_deal_onboard_train.values)[0][0]
     ii_end = np.where(train_end_date==x_deal_onboard_train.values)[0][0]
-    x_deal_onboard_train = x_deal_onboard_train[ii_start:ii_end]
-    y_deal_onboard_train = y_deal_onboard_train[ii_start:ii_end]
+    x_deal_onboard_train = x_deal_onboard_train[ii_start:ii_end+1]
+    y_deal_onboard_train = y_deal_onboard_train[ii_start:ii_end+1]
 
     # y_deal_onboard_scale = y_deal_onboard_train.max()
     y_deal_onboard_scale = 1
@@ -328,7 +353,10 @@ def forecast_filplus_rate(train_start_date: datetime.date,
     forecast_date_vec = u.make_forecast_date_vec(forecast_start_date, forecast_length)
     deal_onboard_pred *= y_deal_onboard_scale
 
-    y_cc_onboard_train = jnp.clip(jnp.array(y_rb_onboard_train - y_deal_onboard_train), a_min=0.001)
+    bias = 5  # in High FIL+ rates, CC onboarding is really low, and when the values hit 0, MCMC doesn't like it
+              # so we can add a bias
+              # TODO: make this programmatic
+    y_cc_onboard_train = jnp.clip(jnp.array(y_rb_onboard_train - y_deal_onboard_train)+bias, a_min=0.001)
     # y_cc_onboard_scale = y_cc_onboard_train.max()
     y_cc_onboard_scale = 1
     cc_onboard_pred, cc_onboard_pred_rhats = mcmc_predict(y_cc_onboard_train/y_cc_onboard_scale, forecast_length,
@@ -337,6 +365,7 @@ def forecast_filplus_rate(train_start_date: datetime.date,
                                    seasonality_mcmc=seasonality_mcmc, 
                                    num_chains_mcmc=num_chains_mcmc,
                                    verbose=verbose)
+    cc_onboard_pred -= bias
     cc_onboard_pred *= y_cc_onboard_scale
 
     xx = x_rb_onboard_train
@@ -456,3 +485,49 @@ def characterize_mcmc_forecast(
                         pbar.update(1)
                         
     return characterization_results
+
+
+def forecast_filplus_rate_logistic(train_end_date: datetime.date,
+                                   forecast_length: int,
+                                   num_warmup_mcmc: int = 500,
+                                   num_samples_mcmc: int = 100,
+                                   num_chains_mcmc: int = 2,
+                                   verbose: bool = True):
+    """
+    This forecast assumes that the FIL+ rate follows a logistic curve. This assumption 
+    shoud be checked from time to time, but at the time of developing this function,
+    it seems reasonable.  FIL+ rate went from very low (beginning of network) to high.
+    The model will hold as long as FIL+ rate stays high, but if it drops, the assumption
+    is invalid.
+    """
+    u.sanity_check_date(train_end_date, err_msg="Specified train_end_date is after today!")
+    train_start_date = date(2022, 1, 1)
+    filp_train_t, filp_train = u.get_historical_filplus_rate(
+        start_date=train_start_date, end_date=train_end_date
+    )
+    day = jnp.arange(len(filp_train))
+
+    # TODO: integrate into the mcmc_forecast function
+    mcmc = MCMC(
+        NUTS(logistic_growth_model, dense_mass=True),
+        num_warmup=num_warmup_mcmc,
+        num_samples=num_samples_mcmc,
+        num_chains=num_chains_mcmc,
+        progress_bar=verbose
+    )
+        
+    mcmc.run(random.PRNGKey(1), x=day, y=filp_train)
+    mcmc.print_summary()
+
+    day_forecast = jnp.arange(len(filp_train) + forecast_length)
+    predictive = Predictive(logistic_growth_model, mcmc.get_samples())
+    preds = predictive(random.PRNGKey(1), x=day_forecast)["obs"]
+    rhat_array = get_rhats(mcmc)
+    # Note the quantiles are not well defined for Bernoulli likelihood
+    # But this would be fine with normal likelihood
+    # pi = jnp.percentile(preds,  jnp.array([25, 75]), 0)
+
+    # the user is expected to index/slice the part of the output that is relevant to their date-range
+    historical_date_vec = u.make_forecast_date_vec(train_start_date, len(filp_train))
+    forecast_date_vec = u.make_forecast_date_vec(train_start_date, len(day_forecast))
+    return forecast_date_vec, preds, historical_date_vec, filp_train, rhat_array

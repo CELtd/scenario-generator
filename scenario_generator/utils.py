@@ -134,19 +134,20 @@ def get_historical_filplus_rate(start_date: datetime.date,
                                 end_date: datetime.date):
     rb_onboard_t_vec, rb_onboard_vec = get_historical_daily_onboarded_power(start_date, end_date)
     deal_onboard_t_vec, deal_onboard_vec = get_historical_deals_onboard(start_date, end_date)
-
+    
     # align the data
     start_date_aligned = pd.to_datetime(max(deal_onboard_t_vec.values[0], rb_onboard_t_vec.values[0]))
     end_date_aligned = pd.to_datetime(min(deal_onboard_t_vec.values[-1], rb_onboard_t_vec.values[-1]))
 
     ii_start = np.where(start_date_aligned==rb_onboard_t_vec.values)[0][0]
     ii_end = np.where(end_date_aligned==rb_onboard_t_vec.values)[0][0]
-    rb_onboard_vec_aligned = rb_onboard_vec[ii_start:ii_end]
+    rb_onboard_vec_aligned = rb_onboard_vec[ii_start:ii_end+1]
 
     ii_start = np.where(start_date_aligned==deal_onboard_t_vec.values)[0][0]
     ii_end = np.where(end_date_aligned==deal_onboard_t_vec.values)[0][0]
-    deal_onboard_vec_aligned = deal_onboard_vec[ii_start:ii_end]
+    deal_onboard_vec_aligned = deal_onboard_vec[ii_start:ii_end+1]
 
-    t_vec_aligned = deal_onboard_t_vec[ii_start:ii_end]
+    t_vec_aligned = deal_onboard_t_vec[ii_start:ii_end+1]
     historical_filplus_rate = deal_onboard_vec_aligned/rb_onboard_vec_aligned
+
     return t_vec_aligned, historical_filplus_rate
